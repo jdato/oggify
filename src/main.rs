@@ -16,12 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use env_logger::{Builder, Env};
+use id3::{TagLike, frame, Version};
 use librespot_audio::{AudioDecrypt, AudioFile};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::SessionConfig;
 use librespot_core::session::Session;
 use librespot_core::spotify_id::SpotifyId;
-use librespot_metadata::{Album, Artist, FileFormat, Metadata, Track};
+use librespot_metadata::{Album, Artist, audio::AudioFileFormat, Metadata, Track};
 use regex::Regex;
 use scoped_threadpool::Pool;
 
@@ -37,10 +38,17 @@ fn main() {
 
   let core = tokio::runtime::Runtime::new().unwrap();
   let session_config = SessionConfig::default();
+  
   let credentials = Credentials::with_password(args[1].to_owned(), args[2].to_owned());
   info!("Connecting ...");
-  let session = core
-    .block_on(Session::connect(session_config, credentials, None))
+  let session = 
+  core
+    .block_on(async {
+      Session::new(session_config, None)
+    });
+
+  core
+    .block_on(Session::connect(&session, credentials, false))
     .unwrap();
   info!("Connected!");
 
@@ -65,30 +73,30 @@ fn main() {
       })
     })
     .for_each(|id| {
-      info!("Getting track {}...", id.to_base62());
+      info!("Getting track {:?}...", id.to_base62());
       let mut track = core
-        .block_on(Track::get(&session, id))
+        .block_on(Track::get(&session, &id))
         .expect("Cannot get track metadata");
-      if !track.available {
+      if !track.availability.is_empty() {
         warn!(
-          "Track {} is not available, finding alternative...",
+          "Track {:?} is not available, finding alternative...",
           id.to_base62()
         );
         let alt_track = track.alternatives.iter().find_map(|id| {
           let alt_track = core
-            .block_on(Track::get(&session, *id))
+            .block_on(Track::get(&session, id))
             .expect("Cannot get track metadata");
-          match alt_track.available {
+          match !alt_track.availability.is_empty() {
             true => Some(alt_track),
             false => None,
           }
         });
         track = alt_track.expect(&format!(
-          "Could not find alternative for track {}",
+          "Could not find alternative for track {:?}",
           id.to_base62()
         ));
         warn!(
-          "Found track alternative {} -> {}",
+          "Found track alternative {:?} -> {:?}",
           id.to_base62(),
           track.id.to_base62()
         );
@@ -98,7 +106,7 @@ fn main() {
         .iter()
         .map(|id| {
           core
-            .block_on(Artist::get(&session, *id))
+            .block_on(Artist::get(&session, &id.id))
             .expect("Cannot get artist metadata")
             .name
         })
@@ -114,15 +122,15 @@ fn main() {
       );
       let file_id = track
         .files
-        .get(&FileFormat::OGG_VORBIS_320)
-        .or(track.files.get(&FileFormat::OGG_VORBIS_160))
-        .or(track.files.get(&FileFormat::OGG_VORBIS_96))
-        .expect("Could not find a OGG_VORBIS format for the track.");
+        .get(&AudioFileFormat::OGG_VORBIS_320)
+        // .or(track.files.get(&AudioFileFormat::OGG_VORBIS_160))
+        // .or(track.files.get(&AudioFileFormat::OGG_VORBIS_96))
+        .expect("Could not find the 320kbs OGG_VORBIS format for the track.");
       let key = core
         .block_on(session.audio_key().request(track.id, *file_id))
-        .expect("Cannot get audio key");
+        .ok();
       let mut encrypted_file = core
-        .block_on(AudioFile::open(&session, *file_id, 320, true))
+        .block_on(AudioFile::open(&session, *file_id, 320))
         .unwrap();
       let mut buffer = Vec::new();
       let mut read_all: Result<usize> = Ok(0);
@@ -142,18 +150,61 @@ fn main() {
       AudioDecrypt::new(key, &buffer[..])
         .read_to_end(&mut decrypted_buffer)
         .expect("Cannot decrypt stream");
+
+      let album = core
+        .block_on(Album::get(&session, &track.album.id))
+        .expect("Cannot get album metadata");
+
       if args.len() == 3 {
+        log::info!("Track: {:#?}", track);
+        log::info!("Album: {:#?}", album);
+        
         let fname = format!("{} - {}.ogg", artists_strs.join(", "), track.name);
-        std::fs::write(&fname, &decrypted_buffer[0xa7..]).expect("Cannot write decrypted track");
-        info!("Filename: {}", fname);
+        let fname_mp3 = format!("{} - {}.mp3", artists_strs.join(", "), track.name);
+
+        std::fs::write(&format!("music/{}", fname.clone()), &decrypted_buffer[0xa7..]).expect("Cannot write decrypted track");
+        info!("Wrote file with filename: {}", fname);
+
+        // convert to mp3 highest quality
+        let output = Command::new("ffmpeg")
+        .arg("-i")
+        .arg(&format!("music/{}", fname.clone()))
+        .arg("-map_metadata")
+        .arg("0:s:0")
+        .arg("-id3v2_version")
+        .arg("3")
+        .arg("-codec:a")
+        .arg("libmp3lame")
+        .arg("-qscale:a")
+        .arg("1")
+        .arg(&format!("music/{}", fname_mp3.clone())) // TO CHANGE
+        .output()
+        .expect("Failed to do convert");
+
+        info!("status: {}", output.status);
+
+        info!("Converted file with filename: {} to {}", fname.clone(), fname_mp3);
+        if let Err(e) = std::fs::remove_file(&format!("music/{}", fname.clone())) {
+          error!("Couldn't remove file: {:?}, error: {:?}", &format!("music/{}", fname.clone()), e)
+        }
+
+        // TODO find more metadata - # of plays
+
+        let mut tag = id3::Tag::new();
+        tag.set_genre(album.genres.join(", "));
+        tag.set_album(album.name);
+        tag.set_title(track.name);
+        tag.set_artist(artists_strs.join(", "));
+        tag.add_frame(frame::Comment{ lang: "en".to_owned(), description: "A comment".to_owned(), text: "Plays xyz".to_owned() });
+
+        if let Err(e) = tag.write_to_path(&format!("music/{}", fname_mp3), Version::Id3v24) {
+          error!("Error ID3: {:?}", e);
+        }
       } else {
-        let album = core
-          .block_on(Album::get(&session, track.album))
-          .expect("Cannot get album metadata");
         let mut cmd = Command::new(args[3].to_owned());
         cmd.stdin(Stdio::piped());
         cmd
-          .arg(id.to_base62())
+          .arg(id.to_base62().unwrap())
           .arg(track.name)
           .arg(album.name)
           .args(artists_strs.iter());
