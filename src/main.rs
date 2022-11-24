@@ -16,12 +16,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use env_logger::{Builder, Env};
+use http::Request;
+use hyper::body::{HttpBody, self};
+use id3::frame::{Picture, PictureType};
 use id3::{TagLike, frame, Version};
 use librespot_audio::{AudioDecrypt, AudioFile};
+use librespot_core::http_client::HttpClient;
+use librespot_core::{FileId, http_client};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::SessionConfig;
 use librespot_core::session::Session;
 use librespot_core::spotify_id::SpotifyId;
+use librespot_metadata::audio::item::CoverImage;
+use librespot_metadata::image::{Image, ImageSize, TranscodedPicture, PictureSize};
+use librespot_metadata::show::ShowMediaType;
 use librespot_metadata::{Album, Artist, audio::AudioFileFormat, Metadata, Track};
 use regex::Regex;
 use scoped_threadpool::Pool;
@@ -155,6 +163,8 @@ fn main() {
         .block_on(Album::get(&session, &track.album.id))
         .expect("Cannot get album metadata");
 
+      let album_clone = album.clone();
+
       if args.len() == 3 {
         log::info!("Track: {:#?}", track);
         log::info!("Album: {:#?}", album);
@@ -196,6 +206,49 @@ fn main() {
         tag.set_title(track.name);
         tag.set_artist(artists_strs.join(", "));
         tag.add_frame(frame::Comment{ lang: "en".to_owned(), description: "A comment".to_owned(), text: "Plays xyz".to_owned() });
+        let cover = core
+          .block_on(
+            async move {
+              if let Some(cover) = album_clone.covers.sort_by_key(|c|c.size).first() {
+                  if let Ok(req) = Request::builder()
+                  .method("GET")
+                  .uri(format!("https://i.scdn.co/image/{}", cover.id))
+                  .body(hyper::body::Body::default()) {
+                    if let Ok(cover_image) = HttpClient::new(None).request(req).await {
+                      
+                      let mut data = Vec::new();
+                      let mut body = cover_image.into_body();
+
+                      while !body.is_end_stream() {
+                        if let Some(chunk) = body
+                          .data()
+                          .await
+                          .and_then(|body| 
+                            body
+                            .ok()
+                            .and_then(|bytes|
+                              Some(bytes.to_vec())
+                            )
+                          ) {
+                            data.extend(chunk)
+                          }
+                      }
+                      
+                      return Some(data);
+                    } else { return None; }
+                  } else { return None; }
+                } else { return None; }
+            }
+          );
+        
+        if let Some(jpeg) = cover {
+          tag.add_picture(Picture {
+            mime_type: "image/jpeg".to_string(),
+            picture_type: PictureType::CoverFront,
+            description: "Cover Image".to_string(),
+            data: jpeg,
+          });
+        }
 
         if let Err(e) = tag.write_to_path(&format!("music/{}", fname_mp3), Version::Id3v24) {
           error!("Error ID3: {:?}", e);

@@ -1105,6 +1105,8 @@ name = "oggify"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "http",
+ "hyper",
  "id3",
  "librespot-audio",
  "librespot-core",
