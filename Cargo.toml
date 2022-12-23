@@ -10,6 +10,7 @@ repository = "https://github.com/pisto/oggify"
 readme = "README.md"
 
 [dependencies]
+chrono = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 librespot-core = { git = "https://github.com/librespot-org/librespot.git", branch = "dev" }
 librespot-metadata = { git = "https://github.com/librespot-org/librespot.git", branch = "dev" }

@@ -15,11 +15,12 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use chrono::{Local, Datelike, Timelike};
 use env_logger::{Builder, Env};
 use http::Request;
 use hyper::body::HttpBody;
 use id3::frame::{PictureType, Comment};
-use id3::{frame, TagLike, Version};
+use id3::{frame, TagLike, Version, Frame, Content, Timestamp};
 use librespot_audio::{AudioDecrypt, AudioFile};
 use librespot_core::authentication::Credentials;
 use librespot_core::config::SessionConfig;
@@ -37,7 +38,8 @@ fn main() {
     let args: Vec<_> = env::args().collect();
     assert!(
         args.len() == 3 || args.len() == 4,
-        "Usage: {} user password [helper_script] < tracks_file",
+        "Invalid number of arguments: [{}] please provide '3' or '4' arguments. Usage: {} user password [update_id3] < tracks_file",
+        args.len(),
         args[0]
     );
 
@@ -79,7 +81,7 @@ fn main() {
 
       playlist.contents.items.iter().for_each(|pl_item| {
         //
-        info!("Getting track {:?}, form playlist {:?}", pl_item.id.to_base62(), playlist.name());
+        info!("Reading track {:?}, form playlist {:?}", pl_item.id.to_base62(), playlist.name());
         let mut track = core
           .block_on(Track::get(&session, &pl_item.id))
           .expect("Cannot get track metadata");
@@ -140,9 +142,12 @@ fn main() {
 
         // Check if file exists
         
-        match std::path::Path::try_exists(Path::new(final_mp3_file_path.as_str())) {
-            Ok(true) => log::info!("Skipping {track_name} by {artists_strs:?}, because it already exists at '{final_mp3_file_path}'."),
-            Ok(false) => {
+        match (std::path::Path::try_exists(Path::new(final_mp3_file_path.as_str())), args.get(3)) {
+            (Ok(true), None) => log::debug!("Skipping {track_name} by {artists_strs:?}, because it already exists at '{final_mp3_file_path}'."),
+            (Ok(exists), update_id3) => {
+              
+              if !exists {
+
                 log::info!("Dowloading {track_name} by {artists_strs:?}.");
                 if let Some((file_id, bitrate)) = track
                 .files
@@ -179,12 +184,6 @@ fn main() {
                     .read_to_end(&mut decrypted_buffer)
                     .expect("Cannot decrypt stream");
 
-                    let album = core
-                    .block_on(Album::get(&session, &track.album.id))
-                    .expect("Cannot get album metadata");
-
-                    let album_clone = album.clone();
-
                     match std::fs::create_dir(&target_dir_path) {
                         Ok(_) => info!("Created directory '{}'.", target_dir_path),
                         Err(e) => info!("Could not create directory '{}'. Message: {:?}", target_dir_path, e),
@@ -215,24 +214,46 @@ fn main() {
                     if let Err(e) = std::fs::remove_file(&final_ogg_file_path) {
                     error!("Couldn't remove file: {:?}, error: {:?}", final_ogg_file_path, e)
                     }
-
+                  }
+                  } else {
+                    log::debug!("Skipping {track_name} by {artists_strs:?}, because it already exists at '{final_mp3_file_path}'.");
+                  }
                     // TODO find more metadata - # of plays
-
+                  if !exists || update_id3.map(|update| update.eq("update_id3")).unwrap_or(false) {
+                    log::info!("Updating Metadata for '{final_mp3_file_path}'.");
                     let mut tag = id3::Tag::new();
-                    tag.set_genre(album.genres.join(", "));
-                    tag.set_album(album.name);
+
+                    let album = core
+                    .block_on(Album::get(&session, &track.album.id))
+                    .expect("Cannot get album metadata");
+
+                    tag.set_album(&album.name);
                     tag.set_title(track_name);
-                    tag.add_frame(Comment {
-                        lang: "en".to_owned(),
-                        description: "Bitrate".to_owned(),
-                        text: bitrate.to_string(),
+                  
+                    let date = Local::now();
+                    let time = date.time();
+
+                    tag.set_date_released(Timestamp {
+                      year: date.year(),
+                      month: Some(date.month() as u8),
+                      day: Some(date.day() as u8),
+                      hour: Some(time.hour() as u8),
+                      minute: Some(time.minute() as u8),
+                      second: Some(time.second() as u8), 
                     });
+                    tag.set_genre(playlist_dir_name.to_owned());
+                    let genres = album.genres.join(", ");
+                    let info = Frame::with_content("COMM", Content::Comment(Comment {
+                      lang: "en".to_owned(),
+                      description: "Info".to_owned(),
+                      text: format!("Playlist: {}{}", &playlist_dir_name, if !genres.is_empty() {format!(", Genres: {}", genres)} else {"".into()}),
+                    }));
+                    tag.add_frame(info);
                     tag.set_artist(artists_strs.join(", "));
-                    tag.add_frame(frame::Comment{ lang: "en".to_owned(), description: "A comment".to_owned(), text: "Plays xyz".to_owned() });
                     let cover = core
                     .block_on(
                         async move {
-                        if let Some(cover) = album_clone.covers.first() {
+                        if let Some(cover) = album.covers.first() {
                             if let Ok(req) = Request::builder()
                             .method("GET")
                             .uri(format!("https://i.scdn.co/image/{}", cover.id))
@@ -269,12 +290,14 @@ fn main() {
                             data: jpeg,
                         });
                     }
-                    if let Err(e) = tag.write_to_path(&format!("music/{}/{}", playlist_dir_name, fname_mp3), Version::Id3v24) {
-                        error!("Error ID3: {:?}", e);
+                    let id_3_path = format!("music/{}/{}", playlist_dir_name, fname_mp3);
+                    if let Err(e) = tag.write_to_path(&id_3_path, Version::Id3v24) {
+                        error!("Error ID3: {:?}, Path: {}", e, id_3_path);
                     }
-                }
+                  }
+                
             },
-            Err(e) => log::error!("An error occurred when trying to check for existing file: {final_mp3_file_path}. Error: {:?}", e),
+            (Err(e), _) => log::error!("An error occurred when trying to check for existing file: {final_mp3_file_path}. Error: {:?}", e),
         }
       });
     });
