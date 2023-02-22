@@ -120,11 +120,8 @@ pub fn read(args: Vec<String>) {
 
         let base_dir_name = "music";
         let playlist_dir_name = playlist.name();
-        let target_dir_path = format!("{base_dir_name}/{playlist_dir_name}");
-        let final_ogg_file_path = format!("{target_dir_path}/{fname_ogg}");
-        let final_mp3_file_path = format!("{target_dir_path}/{fname_mp3}");
-
-        
+        let final_ogg_file_path = format!("{base_dir_name}/{fname_ogg}");
+        let final_mp3_file_path = format!("{base_dir_name}/{fname_mp3}");
 
         match (std::path::Path::try_exists(Path::new(final_mp3_file_path.as_str())), args.get(3)) {
             (Ok(true), None) => debug!("Skipping {track_name} by {artists_strs:?}, because it already exists at '{final_mp3_file_path}'."),
@@ -174,17 +171,13 @@ pub fn read(args: Vec<String>) {
                     .read_to_end(&mut decrypted_buffer)
                     .expect("Cannot decrypt stream");
 
-                    match std::fs::create_dir(&target_dir_path) {
-                        Ok(_) => info!("Created directory '{}'.", target_dir_path),
-                        Err(e) => info!("Could not create directory '{}'. Message: {:?}", target_dir_path, e),
-                    }
                     std::fs::write(&final_ogg_file_path, &decrypted_buffer[0xa7..]).expect("Cannot write decrypted track");
                     info!("Wrote file with filename: {}", fname_ogg);
 
                     // convert to mp3 highest quality
                     let output = Command::new("ffmpeg")
                     .arg("-i")
-                    .arg(&format!("music/{}/{}", playlist_dir_name, fname_ogg.clone()))
+                    .arg(&final_ogg_file_path)
                     .arg("-map_metadata")
                     .arg("0:s:0")
                     .arg("-id3v2_version")
